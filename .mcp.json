@@ -1,10 +1,12 @@
 {
   "mcpServers": {
     "sudo39": {
-      "command": "/Users/aquintanar/Development/sudo39/dist/sudo39-macos-arm64",
+      "command": "${HOME}/.local/bin/sudo39",
       "args": [],
       "env": {
-        "SUDO39_ALLOWED_PROGRAMS": "id,whoami,systemctl"
+        "SUDO39_ALLOWED_PROGRAMS": "/usr/bin/id,/usr/bin/whoami",
+        "SUDO39_ALLOWED_MODES": "auto",
+        "SUDO39_TIMEOUT_SECS": "120"
       }
     }
   }

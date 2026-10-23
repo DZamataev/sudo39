@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] - hardened fork
+
+### Removed
+
+- Runtime policy tools `sudo39_add_allowed_program`, `sudo39_remove_allowed_program`, `sudo39_set_allow_unsafe`, `sudo39_reload_policy_from_env` and the `confirm_*` prompts; the policy is read-only and comes from the startup environment.
+
+### Changed
+
+- `command` and `SUDO39_ALLOWED_PROGRAMS` entries must be absolute, symlink-free paths of root-owned files in root-owned, non-group/other-writable directories; checked at startup and on every call. Bare names such as `id` are rejected.
+- The macOS administrator dialog shows the quoted command.
+
+### Added
+
+- `SUDO39_ALLOWED_MODES` (default `auto`).
+
+### Fixed
+
+- Truncation is reported when one read exceeds `SUDO39_OUTPUT_LIMIT_BYTES`.
+
+### Known gaps
+
+- `openclaw-plugin/` still proxies the removed policy tools; calls to them fail with "Tool not found".
+
 ## [v1.0.2] - 2026-04-16
 
 ### Added

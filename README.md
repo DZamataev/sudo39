@@ -8,7 +8,7 @@ sudo39 is a small MCP server built with [TurboMCP](https://github.com/Epistates/
 sudo_run(command, arguments?, mode?)
 ```
 
-> **Hardened fork (dz/security-hardening).** The policy is read-only at runtime: the MCP admin tools and confirmation prompts are removed, programs are absolute paths of root-owned files, the elevation modes are allowlisted, and the macOS dialog shows the exact command. See "Security changes" below.
+> **Hardened fork** of [alejandroqh/sudo39](https://github.com/alejandroqh/sudo39). The policy is read-only at runtime: the MCP admin tools and confirmation prompts are removed, programs are absolute paths of root-owned files, the elevation modes are allowlisted, and the macOS dialog shows the exact command. See [Security changes](#security-changes). Install it from this repository: `cargo install sudo39` and the upstream installer script fetch the unhardened upstream build.
 
 Example MCP tool arguments:
 
@@ -77,38 +77,62 @@ A timeout kills the launcher (`osascript`, `sudo`, `pkexec`), not an already ele
 
 ## Install
 
-```bash
-cargo install sudo39
-```
-
-### Install for any AI CLI / IDE
-
-Installs the binary and auto-configures it for every MCP client detected: **Claude Code**, **Claude Desktop**, **Codex**, **OpenCode**, **OpenClaw**.
+Build from this repository; the crate on crates.io and the upstream `h39.sh` installer are the unhardened upstream version.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/alejandroqh/marketplace/main/h39.sh | bash
+git clone https://github.com/DZamataev/sudo39.git
+cd sudo39
+cargo test --locked
+cargo build --release --locked
+install -m 0755 target/release/sudo39 ~/.local/bin/sudo39
 ```
 
-## Build
-
-```sh
-cargo build --release
-```
+or `cargo install --locked --git https://github.com/DZamataev/sudo39 --branch main`.
 
 ## MCP Client Config
 
-For a stdio MCP client:
+The policy lives in the client's server entry, so the client process that launches sudo39 is where you widen or narrow it. For a stdio MCP client:
 
 ```json
 {
   "mcpServers": {
     "sudo39": {
       "command": "/absolute/path/to/sudo39",
-      "args": []
+      "args": [],
+      "env": {
+        "SUDO39_ALLOWED_PROGRAMS": "/usr/bin/id,/usr/bin/whoami",
+        "SUDO39_ALLOWED_MODES": "auto",
+        "SUDO39_TIMEOUT_SECS": "120"
+      }
     }
   }
 }
 ```
+
+On macOS the administrator dialog waits inside `SUDO39_TIMEOUT_SECS`; 30 seconds is often too short to read the command and type a password. Keep the client's own tool-call timeout above it.
+
+DeepSeek Harness reads the same entry from `$DSH_HOME/cordis.patch.yml`:
+
+```yaml
+- insert:
+    - id: mcp-sudo39
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: sudo39
+        transport: stdio
+        command: /Users/<you>/.local/bin/sudo39
+        args: []
+        cwd: !!js process.cwd()
+        env:
+          SUDO39_ALLOWED_PROGRAMS: /usr/bin/id,/usr/bin/whoami
+          SUDO39_ALLOWED_MODES: auto
+          SUDO39_ALLOW_UNSAFE: '0'
+          SUDO39_TIMEOUT_SECS: '120'
+        toolCallTimeoutMs: 150000
+        failOnStartupError: true
+```
+
+Set `SUDO39_ALLOW_UNSAFE: '0'` explicitly when the client merges its ambient environment into the server's, so an inherited `SUDO39_ALLOW_UNSAFE=1` cannot turn the allowlist off.
 
 ## Notes
 
