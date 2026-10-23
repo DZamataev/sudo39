@@ -42,6 +42,21 @@ Every program, at startup and again on each call, must be an absolute path witho
 
 An allowlisted program that accepts arbitrary arguments, such as `sh`, `env`, `launchctl`, `cp`, `tee`, `dd`, or `systemctl`, gives the client full root. Allowlist only programs whose every argument combination you accept.
 
+### Asking for unlisted programs and remembering approval (macOS)
+
+Two opt-in flags let the user approve programs at the moment the agent needs them, with the password as the only approval channel. Buttons alone would not do: an agent with computer-use tools can click a dialog, but it cannot type the user's password.
+
+```sh
+export SUDO39_PROMPT_UNLISTED=1   # unlisted programs ask for the password instead of failing
+export SUDO39_REMEMBER=1          # one password covers later calls for sudo's timestamp_timeout
+```
+
+- `SUDO39_PROMPT_UNLISTED=1`: a program outside `SUDO39_ALLOWED_PROGRAMS` opens the password dialog marked "⚠ NOT IN ALLOWLIST". The password approves the program for the rest of this server run (`approved_this_run` in `sudo39_policy`); a restart forgets it. Only `auto` mode asks, and the trusted-path check still applies, so the agent cannot get its own binary approved.
+- `SUDO39_REMEMBER=1`: `auto` runs `sudo -A -v` with sudo39's own askpass dialog, which names the command, then `sudo -n -- <program>`. Without a terminal, sudo keys its credential cache to the parent process, so the password unlocks sudo for this server process only, for `timestamp_timeout` (5 minutes unless sudoers changes it). A first-time unlisted program resets that cache first, so its approval always takes a password. The password travels from the dialog to sudo's askpass pipe and never reaches the MCP process.
+- After each authentication sudo39 runs `sudo -n /usr/bin/true` from a separate child process. If that succeeds, the credential is shared (`Defaults timestamp_type=global` or a `NOPASSWD` rule), so sudo39 resets it and refuses the call.
+
+Each flag accepts only `0` or `1`; any other value stops the server at startup. On other platforms both flags stop the server at startup.
+
 Runtime limits default to 30 seconds and 4 KiB (~1000 LLM tokens) per output stream:
 
 ```sh
@@ -71,6 +86,7 @@ Compared with upstream `7e0d7fc`:
 2. Programs must be absolute and pass the trusted-path check. Upstream matched bare names such as `id`, which `sudo` resolves through the inherited `PATH`; a client able to write to a `PATH` directory could plant its own `id` and run it as root.
 3. `SUDO39_ALLOWED_MODES` limits the requested elevation mechanism, so a client cannot switch to `sudo -n` to reuse a cached timestamp without a dialog.
 4. The macOS administrator dialog shows the command; upstream showed only "osascript wants to make changes".
+6. Opt-in `SUDO39_PROMPT_UNLISTED` and `SUDO39_REMEMBER` restore approval on the fly through the password dialog, which the client cannot complete itself.
 5. Output truncation is reported when a single read exceeds the limit.
 
 A timeout kills the launcher (`osascript`, `sudo`, `pkexec`), not an already elevated child; the result says so.
@@ -127,6 +143,8 @@ DeepSeek Harness reads the same entry from `$DSH_HOME/cordis.patch.yml`:
           SUDO39_ALLOWED_PROGRAMS: /usr/bin/id,/usr/bin/whoami
           SUDO39_ALLOWED_MODES: auto
           SUDO39_ALLOW_UNSAFE: '0'
+          SUDO39_PROMPT_UNLISTED: '1'   # optional, macOS
+          SUDO39_REMEMBER: '1'          # optional, macOS
           SUDO39_TIMEOUT_SECS: '120'
         toolCallTimeoutMs: 150000
         failOnStartupError: true

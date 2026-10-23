@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - `SUDO39_ALLOWED_MODES` (default `auto`).
+- macOS `SUDO39_PROMPT_UNLISTED=1`: an unlisted program asks for the password in a dialog marked NOT IN ALLOWLIST and stays approved until the server restarts.
+- macOS `SUDO39_REMEMBER=1`: `sudo -A` with sudo39's own askpass dialog; sudo's per-process credential cache lets one password cover later calls for `timestamp_timeout`. A shared credential (global timestamp or NOPASSWD) is detected, reset, and refused.
+- `sudo_run` results carry an `approval` line.
 
 ### Fixed
 
