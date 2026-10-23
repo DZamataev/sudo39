@@ -1,8 +1,9 @@
 use std::{
     collections::HashSet,
     io::Read,
+    path::Path,
     process::{Command, Output, Stdio},
-    sync::{Arc, RwLock},
+    sync::Arc,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -21,9 +22,11 @@ const _: () = {
     }
 };
 
+/// The policy is fixed at startup from the operator-controlled environment. No MCP tool can
+/// change it: the MCP client is the party the policy restricts.
 #[derive(Clone)]
 struct Sudo39 {
-    policy: Arc<RwLock<Policy>>,
+    policy: Arc<Policy>,
 }
 
 #[server(
@@ -32,30 +35,29 @@ struct Sudo39 {
     description = "Guarded privilege-elevation MCP server for AI agents."
 )]
 impl Sudo39 {
-    fn from_env() -> Self {
+    fn new(policy: Policy) -> Self {
         Self {
-            policy: Arc::new(RwLock::new(Policy::from_env())),
+            policy: Arc::new(policy),
         }
     }
 
-    #[tool("Run a command through the host OS elevation mechanism.")]
+    #[tool("Run an allowlisted program as root. The user approves each call in a native OS dialog that shows the exact command; a denied dialog fails the call.")]
     async fn sudo_run(
         &self,
         #[description(
-            "Program to run, for example \"id\". Must be a single program path; pass arguments with the arguments parameter."
+            "Absolute path of the program, for example \"/usr/bin/id\". It must exactly match an entry of the allowlist shown by sudo39_policy. Pass arguments with the arguments parameter."
         )]
         command: String,
-        #[description(
-            "Optional arguments passed directly to the program. Prefer this over shell-style command strings."
-        )]
+        #[description("Optional arguments passed to the program as separate argv entries, without a shell.")]
         arguments: Option<Vec<String>>,
-        #[description("Elevation mode: auto, sudo, pkexec, macos_osascript, or windows_uac.")]
+        #[description("Elevation mode; omit for auto. Only modes listed by sudo39_policy are accepted.")]
         mode: Option<String>,
     ) -> McpResult<String> {
         let request = CommandRequest::new(command, arguments)?;
-        let mode = ElevationMode::parse(mode.as_deref())?;
+        let mode = ElevationMode::parse(mode.as_deref().unwrap_or("auto"))
+            .map_err(McpError::invalid_params)?;
 
-        if let Err(error) = validate_request(&self.policy, &request) {
+        if let Err(error) = validate_request(&self.policy, mode, &request) {
             audit_request("deny", mode, &request, None);
             return Err(error);
         }
@@ -77,160 +79,75 @@ impl Sudo39 {
         Ok(format_output(&request, mode, &result))
     }
 
-    #[tool("Show the active sudo39 runtime policy.")]
+    #[tool("Show the active sudo39 policy: allowed programs and elevation modes. The policy is read-only.")]
     async fn sudo39_policy(&self) -> McpResult<String> {
-        let policy = read_policy(&self.policy)?;
-        Ok(policy.describe())
-    }
-
-    #[tool("Add a program to the runtime allowlist after explicit confirmation.")]
-    async fn sudo39_add_allowed_program(
-        &self,
-        #[description(
-            "Program path to allow. It must match the command field passed to sudo_run."
-        )]
-        program: String,
-        #[description("Exact confirmation phrase from the confirm_add_allowed_program prompt.")]
-        confirmation: String,
-    ) -> McpResult<String> {
-        let program = normalize_program(program)?;
-        let expected = confirm_add_program_phrase(&program);
-        require_confirmation(&confirmation, &expected)?;
-
-        let mut policy = write_policy(&self.policy)?;
-        policy.allowed_programs.insert(program.clone());
-        audit_policy_update("add_allowed_program", &program);
-
-        Ok(format!("allowed program added: {program}"))
-    }
-
-    #[tool("Remove a program from the runtime allowlist after explicit confirmation.")]
-    async fn sudo39_remove_allowed_program(
-        &self,
-        #[description("Program path to remove from the runtime allowlist.")] program: String,
-        #[description("Exact confirmation phrase from the confirm_remove_allowed_program prompt.")]
-        confirmation: String,
-    ) -> McpResult<String> {
-        let program = normalize_program(program)?;
-        let expected = confirm_remove_program_phrase(&program);
-        require_confirmation(&confirmation, &expected)?;
-
-        let mut policy = write_policy(&self.policy)?;
-        policy.allowed_programs.remove(&program);
-        audit_policy_update("remove_allowed_program", &program);
-
-        Ok(format!("allowed program removed: {program}"))
-    }
-
-    #[tool("Turn runtime unsafe mode on or off after explicit confirmation.")]
-    async fn sudo39_set_allow_unsafe(
-        &self,
-        #[description("true to allow any program, false to return to allowlist enforcement.")]
-        enabled: bool,
-        #[description("Exact confirmation phrase from the confirm_set_allow_unsafe prompt.")]
-        confirmation: String,
-    ) -> McpResult<String> {
-        let expected = confirm_unsafe_phrase(enabled);
-        require_confirmation(&confirmation, expected)?;
-
-        let mut policy = write_policy(&self.policy)?;
-        policy.allow_unsafe = enabled;
-        audit_policy_update("set_allow_unsafe", if enabled { "true" } else { "false" });
-
-        Ok(format!("allow unsafe set to {enabled}"))
-    }
-
-    #[tool("Reload the runtime policy from SUDO39_ALLOWED_PROGRAMS and SUDO39_ALLOW_UNSAFE.")]
-    async fn sudo39_reload_policy_from_env(
-        &self,
-        #[description("Exact confirmation phrase from the confirm_reload_policy_from_env prompt.")]
-        confirmation: String,
-    ) -> McpResult<String> {
-        require_confirmation(&confirmation, confirm_reload_policy_phrase())?;
-
-        let reloaded = Policy::from_env();
-        let description = reloaded.describe();
-        let mut policy = write_policy(&self.policy)?;
-        *policy = reloaded;
-        audit_policy_update(
-            "reload_from_env",
-            "SUDO39_ALLOWED_PROGRAMS,SUDO39_ALLOW_UNSAFE",
-        );
-
-        Ok(format!("policy reloaded from environment\n{description}"))
-    }
-
-    #[prompt("Create a confirmation phrase for allowing a program at runtime.")]
-    async fn confirm_add_allowed_program(&self, program: String, _ctx: &RequestContext) -> String {
-        let program = program.trim();
-        format!(
-            "To allow {program:?} for this running sudo39 server, call sudo39_add_allowed_program with confirmation exactly: {}",
-            confirm_add_program_phrase(program)
-        )
-    }
-
-    #[prompt("Create a confirmation phrase for removing a program from the runtime allowlist.")]
-    async fn confirm_remove_allowed_program(
-        &self,
-        program: String,
-        _ctx: &RequestContext,
-    ) -> String {
-        let program = program.trim();
-        format!(
-            "To remove {program:?} from this running sudo39 server, call sudo39_remove_allowed_program with confirmation exactly: {}",
-            confirm_remove_program_phrase(program)
-        )
-    }
-
-    #[prompt("Create a confirmation phrase for switching runtime unsafe mode on or off.")]
-    async fn confirm_set_allow_unsafe(&self, enabled: String, _ctx: &RequestContext) -> String {
-        let enabled = matches!(enabled.trim(), "true" | "1" | "on" | "yes");
-        format!(
-            "To set runtime unsafe mode to {enabled}, call sudo39_set_allow_unsafe with confirmation exactly: {}",
-            confirm_unsafe_phrase(enabled)
-        )
-    }
-
-    #[prompt("Create a confirmation phrase for reloading policy from the process environment.")]
-    async fn confirm_reload_policy_from_env(&self, _ctx: &RequestContext) -> String {
-        format!(
-            "To replace the runtime policy with the process environment, call sudo39_reload_policy_from_env with confirmation exactly: {}",
-            confirm_reload_policy_phrase()
-        )
+        Ok(self.policy.describe())
     }
 }
 
 #[derive(Debug)]
 struct Policy {
     allowed_programs: HashSet<String>,
+    allowed_modes: Vec<ElevationMode>,
     allow_unsafe: bool,
 }
 
 impl Policy {
-    fn from_env() -> Self {
-        let allowed_programs = std::env::var("SUDO39_ALLOWED_PROGRAMS")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|entry| !entry.is_empty())
-            .map(ToString::to_string)
-            .collect();
-
-        Self {
-            allowed_programs,
-            allow_unsafe: std::env::var("SUDO39_ALLOW_UNSAFE").ok().as_deref() == Some("1"),
+    /// Reads SUDO39_ALLOWED_PROGRAMS, SUDO39_ALLOWED_MODES and SUDO39_ALLOW_UNSAFE.
+    ///
+    /// # Errors
+    /// Returns a description of the first invalid entry: a program that is not an absolute path
+    /// of a root-owned file reachable only through root-owned, non-group/other-writable
+    /// directories, or an unknown mode.
+    fn from_env() -> Result<Self, String> {
+        let mut allowed_programs = HashSet::new();
+        for entry in env_list("SUDO39_ALLOWED_PROGRAMS") {
+            check_trusted_program(&entry)
+                .map_err(|error| format!("SUDO39_ALLOWED_PROGRAMS entry {entry:?}: {error}"))?;
+            allowed_programs.insert(entry);
         }
+
+        let mut allowed_modes = Vec::new();
+        let modes = env_list("SUDO39_ALLOWED_MODES");
+        for entry in if modes.is_empty() { vec!["auto".to_string()] } else { modes } {
+            let mode = ElevationMode::parse(&entry)
+                .map_err(|error| format!("SUDO39_ALLOWED_MODES: {error}"))?;
+            if !allowed_modes.contains(&mode) {
+                allowed_modes.push(mode);
+            }
+        }
+
+        Ok(Self {
+            allowed_programs,
+            allowed_modes,
+            allow_unsafe: std::env::var("SUDO39_ALLOW_UNSAFE").ok().as_deref() == Some("1"),
+        })
     }
 
     fn describe(&self) -> String {
         let mut allowed_programs = self.allowed_programs.iter().collect::<Vec<_>>();
         allowed_programs.sort();
+        let allowed_modes = self
+            .allowed_modes
+            .iter()
+            .map(|mode| mode.as_str())
+            .collect::<Vec<_>>();
 
         format!(
-            "allow_unsafe: {}\nallowed_programs: {:?}",
-            self.allow_unsafe, allowed_programs
+            "allow_unsafe: {}\nallowed_programs: {:?}\nallowed_modes: {:?}",
+            self.allow_unsafe, allowed_programs, allowed_modes
         )
     }
+}
+
+fn env_list(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -241,84 +158,87 @@ struct CommandRequest {
 
 impl CommandRequest {
     fn new(command: String, args: Option<Vec<String>>) -> McpResult<Self> {
+        let program = command.trim();
+        if program.is_empty() {
+            return Err(McpError::invalid_params("program must not be empty"));
+        }
+        if !Path::new(program).is_absolute() {
+            return Err(McpError::invalid_params(
+                "program must be an absolute path, for example /usr/bin/id",
+            ));
+        }
         Ok(Self {
-            program: normalize_program(command)?,
+            program: program.to_string(),
             args: args.unwrap_or_default(),
         })
     }
 }
 
-fn validate_request(policy: &Arc<RwLock<Policy>>, request: &CommandRequest) -> McpResult<()> {
-    let policy = read_policy(policy)?;
-
-    if policy.allow_unsafe {
-        return Ok(());
+fn validate_request(
+    policy: &Policy,
+    mode: ElevationMode,
+    request: &CommandRequest,
+) -> McpResult<()> {
+    if !policy.allowed_modes.contains(&mode) {
+        return Err(McpError::permission_denied(format!(
+            "mode {:?} is not allowed; see sudo39_policy",
+            mode.as_str()
+        )));
     }
-
-    if policy.allowed_programs.contains(&request.program) {
-        return Ok(());
-    }
-
-    Err(McpError::permission_denied(
-        "program is not allowed; set SUDO39_ALLOWED_PROGRAMS or SUDO39_ALLOW_UNSAFE=1",
-    ))
-}
-
-fn read_policy(policy: &Arc<RwLock<Policy>>) -> McpResult<std::sync::RwLockReadGuard<'_, Policy>> {
-    policy
-        .read()
-        .map_err(|_| McpError::internal("policy lock poisoned"))
-}
-
-fn write_policy(
-    policy: &Arc<RwLock<Policy>>,
-) -> McpResult<std::sync::RwLockWriteGuard<'_, Policy>> {
-    policy
-        .write()
-        .map_err(|_| McpError::internal("policy lock poisoned"))
-}
-
-fn normalize_program(program: String) -> McpResult<String> {
-    let program = program.trim();
-    if program.is_empty() {
-        return Err(McpError::invalid_params("program must not be empty"));
-    }
-    if program.contains(char::is_whitespace) {
-        return Err(McpError::invalid_params(
-            "program must be a single program path without whitespace",
+    if !policy.allow_unsafe && !policy.allowed_programs.contains(&request.program) {
+        return Err(McpError::permission_denied(
+            "program is not in the allowlist; see sudo39_policy",
         ));
     }
-    Ok(program.to_string())
+    // Rechecked per call: the file or a parent may have changed since startup.
+    check_trusted_program(&request.program).map_err(McpError::permission_denied)
 }
 
-fn require_confirmation(actual: &str, expected: &str) -> McpResult<()> {
-    if actual == expected {
-        return Ok(());
+/// Rejects a program that a non-root user could replace: the path must be absolute and free of
+/// symlinks, name a regular file owned by root, and every directory on the way must be owned by
+/// root and not writable by group or others.
+#[cfg(unix)]
+fn check_trusted_program(program: &str) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let path = Path::new(program);
+    if !path.is_absolute() {
+        return Err("not an absolute path".to_string());
     }
-
-    Err(McpError::permission_denied(format!(
-        "confirmation mismatch; expected {expected:?}"
-    )))
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve: {error}"))?;
+    if canonical != path {
+        return Err(format!(
+            "path contains a symlink or relative component; use {}",
+            canonical.display()
+        ));
+    }
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    let mut current = Some(path);
+    while let Some(node) = current {
+        let metadata = std::fs::metadata(node).map_err(|error| error.to_string())?;
+        if metadata.uid() != 0 {
+            return Err(format!("{} is not owned by root", node.display()));
+        }
+        if metadata.mode() & 0o022 != 0 {
+            return Err(format!("{} is writable by group or others", node.display()));
+        }
+        current = node.parent();
+    }
+    Ok(())
 }
 
-fn confirm_add_program_phrase(program: &str) -> String {
-    format!("ADD PROGRAM {program}")
-}
-
-fn confirm_remove_program_phrase(program: &str) -> String {
-    format!("REMOVE PROGRAM {program}")
-}
-
-fn confirm_unsafe_phrase(enabled: bool) -> &'static str {
-    if enabled {
-        "ENABLE UNSAFE"
+#[cfg(not(unix))]
+fn check_trusted_program(program: &str) -> Result<(), String> {
+    if Path::new(program).is_absolute() {
+        Ok(())
     } else {
-        "DISABLE UNSAFE"
+        Err("not an absolute path".to_string())
     }
-}
-
-fn confirm_reload_policy_phrase() -> &'static str {
-    "RELOAD POLICY FROM ENV"
 }
 
 struct RunResult {
@@ -328,7 +248,7 @@ struct RunResult {
     stderr_truncated: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ElevationMode {
     Auto,
     Sudo,
@@ -338,16 +258,16 @@ enum ElevationMode {
 }
 
 impl ElevationMode {
-    fn parse(mode: Option<&str>) -> McpResult<Self> {
-        match mode.unwrap_or("auto") {
+    fn parse(mode: &str) -> Result<Self, String> {
+        match mode {
             "auto" => Ok(Self::Auto),
             "sudo" => Ok(Self::Sudo),
             "pkexec" => Ok(Self::Pkexec),
             "macos_osascript" => Ok(Self::MacosOsascript),
             "windows_uac" => Ok(Self::WindowsUac),
-            other => Err(McpError::invalid_params(format!(
+            other => Err(format!(
                 "unsupported elevation mode {other:?}; use auto, sudo, pkexec, macos_osascript, or windows_uac"
-            ))),
+            )),
         }
     }
 
@@ -426,17 +346,33 @@ fn run_pkexec(_request: &CommandRequest) -> Result<RunResult, String> {
     Err("pkexec mode is only available on Linux".to_string())
 }
 
+/// Longest command text shown in the administrator dialog; longer commands are cut with "…".
+#[cfg(target_os = "macos")]
+const PROMPT_COMMAND_LIMIT: usize = 600;
+
 #[cfg(target_os = "macos")]
 fn run_macos_osascript(request: &CommandRequest) -> Result<RunResult, String> {
     let shell_command = shell_join(request);
     let script = format!(
-        "do shell script {} with administrator privileges",
-        apple_script_string(&shell_command)
+        "do shell script {} with prompt {} with administrator privileges",
+        apple_script_string(&shell_command),
+        apple_script_string(&admin_prompt(&shell_command)),
     );
 
-    let mut command = Command::new("osascript");
+    let mut command = Command::new("/usr/bin/osascript");
     command.arg("-e").arg(script);
     run_command(command, "osascript").map_err(|error| format!("osascript failed: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn admin_prompt(shell_command: &str) -> String {
+    let shown = if shell_command.chars().count() > PROMPT_COMMAND_LIMIT {
+        let cut = shell_command.chars().take(PROMPT_COMMAND_LIMIT).collect::<String>();
+        format!("{cut}…")
+    } else {
+        shell_command.to_string()
+    };
+    format!("An AI agent (sudo39 MCP) asks to run as root:\n\n{shown}")
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -540,7 +476,9 @@ fn run_command(mut command: Command, launcher: &'static str) -> Result<RunResult
                 .ok()
                 .and_then(|r| r.ok())
                 .unwrap_or_default();
-            let mut msg = format!("timed out after {timeout} seconds");
+            let mut msg = format!(
+                "timed out after {timeout} seconds; the launcher was killed, an elevated child may still be running"
+            );
             let stdout_text = String::from_utf8_lossy(&stdout.0);
             let stderr_text = String::from_utf8_lossy(&stderr.0);
             if !stdout_text.is_empty() {
@@ -587,12 +525,13 @@ fn read_limited(mut reader: impl Read, limit: usize) -> Result<(Vec<u8>, bool), 
         }
 
         let remaining = limit - output.len();
-        if remaining == 0 {
-            // Drop the reader (closing the pipe) so the child gets SIGPIPE
-            // instead of blocking us reading unbounded output we'd discard.
+        if count > remaining {
+            output.extend_from_slice(&buffer[..remaining]);
+            // Dropping the reader closes the pipe, so the child gets SIGPIPE instead of
+            // blocking on output that would be discarded.
             return Ok((output, true));
         }
-        output.extend_from_slice(&buffer[..count.min(remaining)]);
+        output.extend_from_slice(&buffer[..count]);
     }
 }
 
@@ -654,23 +593,17 @@ fn audit_request(event: &str, mode: ElevationMode, request: &CommandRequest, sta
     );
 }
 
-fn audit_policy_update(action: &str, value: &str) {
-    eprintln!(
-        "sudo39_audit event=policy_update unix_ts={} action={} value={:?}",
-        unix_ts(),
-        action,
-        value
-    );
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use turbomcp::prelude::*;
 
+    let policy = Policy::from_env().map_err(|error| format!("sudo39: invalid policy: {error}"))?;
+    eprintln!("sudo39_audit event=policy unix_ts={} {:?}", unix_ts(), policy.describe());
+
     let mut protocol = ProtocolConfig::multi_version();
     protocol.allow_fallback = true;
 
-    Sudo39::from_env()
+    Sudo39::new(policy)
         .builder()
         .with_protocol(protocol)
         .serve()
@@ -682,38 +615,117 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
+    fn policy(programs: &[&str], modes: &[ElevationMode]) -> Policy {
+        Policy {
+            allowed_programs: programs.iter().map(ToString::to_string).collect(),
+            allowed_modes: modes.to_vec(),
+            allow_unsafe: false,
+        }
+    }
+
     #[test]
-    fn normalizes_program() {
-        let request = CommandRequest::new(" id ".to_string(), None).unwrap();
-        assert_eq!(request.program, "id");
+    fn trims_program() {
+        let request = CommandRequest::new(" /usr/bin/id ".to_string(), None).unwrap();
+        assert_eq!(request.program, "/usr/bin/id");
         assert!(request.args.is_empty());
     }
 
     #[test]
-    fn rejects_whitespace_in_program() {
-        let error = CommandRequest::new("echo hello".to_string(), None).unwrap_err();
-        assert!(error.message.contains("single program path"));
+    fn rejects_relative_program() {
+        let error = CommandRequest::new("id".to_string(), None).unwrap_err();
+        assert!(error.message.contains("absolute path"));
     }
 
     #[test]
-    fn confirmation_phrases_are_exact() {
-        assert_eq!(confirm_add_program_phrase("id"), "ADD PROGRAM id");
-        assert_eq!(confirm_remove_program_phrase("id"), "REMOVE PROGRAM id");
-        assert_eq!(confirm_unsafe_phrase(true), "ENABLE UNSAFE");
-        assert_eq!(confirm_unsafe_phrase(false), "DISABLE UNSAFE");
-        assert_eq!(confirm_reload_policy_phrase(), "RELOAD POLICY FROM ENV");
+    fn rejects_program_outside_allowlist() {
+        let request = CommandRequest::new("/usr/bin/whoami".to_string(), None).unwrap();
+        let error = validate_request(
+            &policy(&["/usr/bin/id"], &[ElevationMode::Auto]),
+            ElevationMode::Auto,
+            &request,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("allowlist"));
+    }
+
+    #[test]
+    fn rejects_mode_outside_policy() {
+        let request = CommandRequest::new("/usr/bin/id".to_string(), None).unwrap();
+        let error = validate_request(
+            &policy(&["/usr/bin/id"], &[ElevationMode::Auto]),
+            ElevationMode::Sudo,
+            &request,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("mode"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_root_owned_system_program() {
+        let request = CommandRequest::new("/usr/bin/id".to_string(), None).unwrap();
+        validate_request(
+            &policy(&["/usr/bin/id"], &[ElevationMode::Auto]),
+            ElevationMode::Auto,
+            &request,
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_user_owned_program_even_when_unsafe() {
+        let dir = std::env::temp_dir().join(format!("sudo39-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("id");
+        std::fs::write(&fake, "#!/bin/sh\n").unwrap();
+        let fake = fake.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        let request = CommandRequest::new(fake.clone(), None).unwrap();
+        let mut unsafe_policy = policy(&[], &[ElevationMode::Auto]);
+        unsafe_policy.allow_unsafe = true;
+        let error = validate_request(&unsafe_policy, ElevationMode::Auto, &request).unwrap_err();
+        assert!(error.message.contains("not owned by root"), "{}", error.message);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_path() {
+        // /tmp is a symlink to /private/tmp on macOS; on Linux /proc/self/exe is a symlink.
+        let candidate = if cfg!(target_os = "macos") { "/tmp" } else { "/proc/self/exe" };
+        let error = check_trusted_program(candidate).unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+    }
+
+    #[test]
+    fn truncation_is_reported_when_output_exceeds_limit() {
+        let (output, truncated) = read_limited(&b"abcdef"[..], 4).unwrap();
+        assert_eq!(output, b"abcd");
+        assert!(truncated);
+        let (output, truncated) = read_limited(&b"abcd"[..], 4).unwrap();
+        assert_eq!(output, b"abcd");
+        assert!(!truncated);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn admin_prompt_shows_quoted_command() {
+        let request = CommandRequest::new(
+            "/usr/bin/id".to_string(),
+            Some(vec!["-u".to_string(), "it's".to_string()]),
+        )
+        .unwrap();
+        let prompt = admin_prompt(&shell_join(&request));
+        assert!(prompt.ends_with("'/usr/bin/id' '-u' 'it'\\''s'"), "{prompt}");
     }
 
     #[test]
     fn policy_describe_sorts_allowed_programs() {
-        let policy = Policy {
-            allowed_programs: ["whoami".to_string(), "id".to_string()].into(),
-            allow_unsafe: false,
-        };
-
+        let policy = policy(&["/usr/bin/whoami", "/usr/bin/id"], &[ElevationMode::Auto]);
         assert_eq!(
             policy.describe(),
-            "allow_unsafe: false\nallowed_programs: [\"id\", \"whoami\"]"
+            "allow_unsafe: false\nallowed_programs: [\"/usr/bin/id\", \"/usr/bin/whoami\"]\nallowed_modes: [\"auto\"]"
         );
     }
 }
